@@ -90,6 +90,8 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <QualityReceiptPanel v-if="showReceiptPanel" />
   </section>
 </template>
 
@@ -104,9 +106,12 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import QualityReceiptPanel from '@/views/QualityReceiptPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+// 质量执行和告警策略是质量批次阻断回执的两个消费面：一个看结论明细，一个看告警交接。
+const showReceiptPanel = props.moduleKey === 'validation_run' || props.moduleKey === 'alert_policy'
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')

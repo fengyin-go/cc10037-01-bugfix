@@ -39,6 +39,7 @@ class QualityRule:
     threshold: float = 0.0        # 允许的最大失败比例 (0~1)
     level: CheckLevel = CheckLevel.WARN
     extra: dict[str, Any] = field(default_factory=dict)
+    rule_version: str = "v1"       # 规则版本：回执和告警必须引用同一版本
     # extra 可包含：
     #   reference_table, reference_field → REFERENCE
     #   expression → EXPRESSION (Python表达式，字段值通过 {value} 传入)
@@ -48,7 +49,12 @@ class QualityRule:
 
 @dataclass
 class ValidationResult:
-    """单条规则对一批数据的校验结果。"""
+    """单条规则对一批数据的校验结果。
+
+    注意：``total_rows`` 是参与该规则校验的样本行数（``sample_size`` 同义），
+    不会因为同一批次还有别的规则而被放大。每条规则的坏行率都只按自己的
+    样本统计，避免一条规则的合格行稀释另一条规则的坏行率。
+    """
     rule_id: str
     total_rows: int
     passed_rows: int
@@ -57,6 +63,33 @@ class ValidationResult:
     threshold_exceeded: bool
     blocked: bool  # 是否触发阻断
     error_samples: list[dict[str, Any]] = field(default_factory=list)
+    # 回执需要的上下文：规则版本、适用阈值和样本数必须与校验结果一起流转
+    rule_name: str = ""
+    rule_version: str = "v1"
+    target_table: str = ""
+    check_field: str = ""
+    check_type: str = ""
+    level: str = CheckLevel.WARN.value
+    threshold: float = 0.0
+    sample_size: int = 0
+
+    @property
+    def bad_rows(self) -> int:
+        """坏行数（与 failed_rows 同义，供回执/告警面板直接引用）。"""
+        return self.failed_rows
+
+    @property
+    def bad_ratio(self) -> float:
+        return self.failed_ratio
+
+    @property
+    def decision(self) -> str:
+        """单规则结论：BLOCK（越线且阻断）/ ALERT（越线仅告警）/ PASS。"""
+        if self.blocked:
+            return "BLOCK"
+        if self.threshold_exceeded:
+            return "ALERT"
+        return "PASS"
 
 
 class ValidationEngine:
@@ -92,6 +125,16 @@ class ValidationEngine:
         self._reference_sets[ref_key] = values
 
     def run(self, rule: QualityRule, rows: list[dict[str, Any]]) -> ValidationResult:
+        context = {
+            "rule_name": rule.rule_name,
+            "rule_version": rule.rule_version,
+            "target_table": rule.target_table,
+            "check_field": rule.check_field,
+            "check_type": rule.check_type.value,
+            "level": rule.level.value,
+            "threshold": rule.threshold,
+            "sample_size": len(rows),
+        }
         checker = self._checkers.get(rule.check_type)
         if checker is None:
             return ValidationResult(
@@ -99,25 +142,27 @@ class ValidationEngine:
                 total_rows=len(rows), passed_rows=0, failed_rows=len(rows),
                 failed_ratio=1.0, threshold_exceeded=True, blocked=True,
                 error_samples=[{"error": f"未知校验类型 {rule.check_type.value}"}],
+                **context,
             )
 
-        if rule.check_type == CheckType.UNIQUE:
-            passed, failed, samples = checker(rows, rule)
-        else:
-            passed, failed, samples = checker(rows, rule)
+        passed, failed, samples = checker(rows, rule)
 
-        total = len(rows) or 1
+        # 分母必须是该规则自己的样本行数；为空批次按 1 处理避免除零。
+        sample_size = len(rows)
+        total = sample_size or 1
         ratio = failed / total
-        blocked = rule.level == CheckLevel.BLOCK and ratio > rule.threshold
+        threshold_exceeded = ratio > rule.threshold
+        blocked = rule.level == CheckLevel.BLOCK and threshold_exceeded
         return ValidationResult(
             rule_id=rule.rule_id,
-            total_rows=total,
+            total_rows=sample_size,
             passed_rows=passed,
             failed_rows=failed,
             failed_ratio=ratio,
-            threshold_exceeded=ratio > rule.threshold,
+            threshold_exceeded=threshold_exceeded,
             blocked=blocked,
             error_samples=samples[:5],
+            **context,
         )
 
     # ---- 内置校验器 ----
@@ -308,6 +353,17 @@ class ValidationEngine:
     ) -> dict[str, Any]:
         """完整的管线质量门禁：执行所有规则 → 汇总 → 通过/阻断决策。"""
         results = self.run_batch(rules, rows)
+        summary = self.summarize_pipeline_quality(results, pipeline_id)
+        # 逐规则原始结果一并返回，供回执按规则阈值判定落账。
+        summary["validation_results"] = results
+        return summary
+
+    def summarize_pipeline_quality(
+        self,
+        results: list[ValidationResult],
+        pipeline_id: str,
+    ) -> dict[str, Any]:
+        """把逐规则结果汇总成门禁结论（不做跨规则坏行率混算）。"""
         any_blocked = any(r.blocked for r in results)
         total_failed = sum(r.failed_rows for r in results)
         total_rows = sum(r.total_rows for r in results) or 1
@@ -316,11 +372,21 @@ class ValidationEngine:
             "rule_results": [
                 {
                     "rule_id": r.rule_id,
+                    "rule_name": r.rule_name,
+                    "rule_version": r.rule_version,
+                    "target_table": r.target_table,
+                    "check_field": r.check_field,
+                    "check_type": r.check_type,
+                    "level": r.level,
                     "total": r.total_rows,
+                    "sample_size": r.sample_size,
                     "passed": r.passed_rows,
                     "failed": r.failed_rows,
                     "ratio": round(r.failed_ratio, 4),
+                    "threshold": r.threshold,
+                    "threshold_exceeded": r.threshold_exceeded,
                     "blocked": r.blocked,
+                    "decision": r.decision,
                 }
                 for r in results
             ],

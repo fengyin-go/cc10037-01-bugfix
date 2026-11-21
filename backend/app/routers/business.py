@@ -42,11 +42,14 @@ def orchestrate_pipeline(body: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/quality/gate")
 def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
-    """对管线数据执行质量门禁。
+    """对管线数据执行质量门禁，并产出阻断回执。
 
     body:
-      pipeline_id, rules: [{"rule_id", "rule_name", "target_table", "check_field",
-                             "check_type", "threshold", "level", "extra": {}}],
+      pipeline_id,
+      batch_id (可选，缺省按 pipeline_id 归并),
+      target_table / partition (可选，写入回执),
+      rules: [{"rule_id", "rule_name", "rule_version", "target_table", "check_field",
+               "check_type", "threshold", "level", "extra": {}}],
       sample_data: [dict]
     """
     pipeline_id = body["pipeline_id"]
@@ -60,24 +63,165 @@ def run_quality_gate(body: dict[str, Any]) -> dict[str, Any]:
             threshold=float(r.get("threshold", 0.01)),
             level=CheckLevel(r.get("level", "WARN")),
             extra=r.get("extra", {}),
+            rule_version=str(r.get("rule_version", "v1")),
         )
         for r in body.get("rules", [])
     ]
     result = _orchestrator.run_quality_gate(
         pipeline_id, rules, body.get("sample_data", []),
+        batch_id=body.get("batch_id"),
+        target_table=body.get("target_table"),
+        partition=str(body.get("partition", "")),
     )
     return {
         "pipeline_id": result.pipeline_id,
+        "batch_id": result.batch_id,
+        "receipt_id": result.receipt_id,
         "overall_pass": result.overall_pass,
         "decision": result.decision,
         "failed_ratio": result.failed_ratio,
         "results": result.results,
+        "receipt": result.receipt,
+        "alert_events": result.alert_events,
+        "gateway": result.gateway,
         "triggered_alerts": [
             {"rule_id": a.rule_id, "rule_name": a.rule_name,
-             "matched": a.matched, "level": a.level.value, "message": a.message}
+             "matched": a.matched, "level": a.level.value, "message": a.message,
+             "actual_values": a.actual_values}
             for a in result.triggered_alerts
         ],
     }
+
+
+# ---- 质量批次阻断回执 / 告警交接 ----
+
+def _ledger():
+    return _orchestrator.ledger
+
+
+@router.get("/quality/receipts")
+def list_receipts() -> dict[str, Any]:
+    """列出所有已确认的质量批次阻断回执。"""
+    ledger = _ledger()
+    receipts = [ledger.receipt_view(r) for r in ledger.list_receipts()]
+    return {"total": len(receipts), "items": receipts}
+
+
+@router.get("/quality/receipts/{receipt_id}")
+def get_receipt(receipt_id: str) -> dict[str, Any]:
+    """读取单份回执：逐规则阈值判定 + 告警交接状态。"""
+    receipt = _ledger().get_receipt(receipt_id)
+    if receipt is None:
+        raise HTTPException(status_code=404, detail=f"回执 {receipt_id} 不存在")
+    return _ledger().receipt_view(receipt)
+
+
+@router.get("/quality/batches/{batch_id}/disposition")
+def batch_disposition(batch_id: str) -> dict[str, Any]:
+    """区分原批可重新提交，还是结论已确认、只剩告警待交接。"""
+    return _ledger().batch_disposition(batch_id)
+
+
+@router.post("/quality/receipts/{receipt_id}/alerts")
+def register_receipt_alerts(receipt_id: str) -> dict[str, Any]:
+    """按回执中的越线规则登记/补投告警给值班组（幂等）。"""
+    ledger = _ledger()
+    events = ledger.register_alerts_from_receipt(receipt_id)
+    if events is None:
+        raise HTTPException(status_code=404, detail=f"回执 {receipt_id} 不存在")
+    receipt = ledger.get_receipt(receipt_id)
+    view = ledger.receipt_view(receipt) if receipt else {}
+    return {
+        "ok": True,
+        "receipt_id": receipt_id,
+        "alert_events": [e.as_dict() for e in events],
+        "alert_state": view.get("alert_state"),
+        "next_action": view.get("next_action"),
+        "batch_disposition": view.get("batch_disposition"),
+        "message": "告警已按回执越线规则登记",
+    }
+
+
+# ---- 告警接收侧 ----
+
+@router.get("/alerts/inbox")
+def alert_inbox(
+    receipt_id: str | None = None,
+    batch_id: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """告警面板：读取已登记告警事件，可按回执/批次/状态过滤。"""
+    ledger = _ledger()
+    events = ledger.list_alerts(
+        receipt_id=receipt_id, batch_id=batch_id, status=status,
+    )
+    return {
+        "total": len(events),
+        "receiver_connected": ledger.receiver_connected,
+        "items": [e.as_dict() for e in events],
+    }
+
+
+@router.post("/alerts/receiver")
+def control_alert_receiver(body: dict[str, Any] | None = None) -> dict[str, Any]:
+    """控制告警接收侧：disconnect 断开，connect/recover 恢复并补投积压。"""
+    ledger = _ledger()
+    action = str((body or {}).get("action", "connect")).strip().lower()
+    if action in {"disconnect", "down", "断连", "断开"}:
+        ledger.disconnect_receiver()
+        return {
+            "ok": True,
+            "receiver_connected": False,
+            "drained": [],
+            "message": "告警接收侧已断开，后续告警保持待交接",
+        }
+    if action in {"connect", "recover", "up", "恢复", "连接"}:
+        drained = ledger.connect_receiver(drain=True)
+        return {
+            "ok": True,
+            "receiver_connected": True,
+            "drained": [e.as_dict() for e in drained],
+            "message": f"告警接收侧已恢复，补投 {len(drained)} 条积压告警",
+        }
+    raise HTTPException(status_code=400, detail=f"未知接收侧动作：{action}")
+
+
+@router.post("/alerts/drain")
+def drain_alerts() -> dict[str, Any]:
+    """接收侧恢复后手动补投待交接告警。"""
+    ledger = _ledger()
+    if not ledger.receiver_connected:
+        return {
+            "ok": False,
+            "receiver_connected": False,
+            "drained": [],
+            "message": "接收侧仍处于断开状态，告警保持待交接",
+        }
+    drained = ledger.drain_pending()
+    return {
+        "ok": True,
+        "receiver_connected": True,
+        "drained": [e.as_dict() for e in drained],
+        "message": f"已补投 {len(drained)} 条积压告警",
+    }
+
+
+@router.get("/alerts/receiver/inbox")
+def receiver_inbox() -> dict[str, Any]:
+    """接收侧（值班组）实际收到的告警投递记录。"""
+    items = _ledger().delivered_inbox()
+    return {"total": len(items), "items": items}
+
+
+@router.get("/quality/receipts/{receipt_id}/alert-evaluation")
+def evaluate_receipt_alert(receipt_id: str) -> dict[str, Any]:
+    """告警面板按回执评估：逐规则阈值判定 + 已登记告警事件。"""
+    from app.services.alert_policy import AlertPolicyService
+
+    result = AlertPolicyService().evaluate_receipt_alerts(receipt_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
 
 
 # ---- 水位与回刷 ----
@@ -343,6 +487,11 @@ def pipeline_run_report(pipeline_id: str) -> dict[str, Any]:
             ),
         ],
         [{"id": "001"}, {"id": None}],
+        batch_id=f"RUN-REPORT-{pipeline_id}",
+        target_table=f"dw.{pipeline_id}",
     )
 
-    return _orchestrator.pipeline_run_report(pipeline_id, record, quality)
+    report = _orchestrator.pipeline_run_report(pipeline_id, record, quality)
+    report["receipt_id"] = quality.receipt_id
+    report["receipt"] = quality.receipt
+    return report

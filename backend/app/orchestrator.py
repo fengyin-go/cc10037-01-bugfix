@@ -26,6 +26,9 @@ from app.engine.schema_evolution import (
     Compatibility, SchemaChange, SchemaColumn, SchemaDefinition,
     SchemaEvolutionEngine,
 )
+from app.engine.quality_receipt import (
+    QualityBatchReceipt, QualityGateLedger, quality_ledger,
+)
 from app.engine.validation_executor import (
     CheckLevel, CheckType, QualityRule, ValidationEngine, ValidationResult,
 )
@@ -56,6 +59,11 @@ class QualityGateResponse:
     failed_ratio: float
     results: list[dict[str, Any]]
     triggered_alerts: list[AlertResult]
+    receipt_id: str | None = None
+    batch_id: str | None = None
+    receipt: dict[str, Any] | None = None
+    alert_events: list[dict[str, Any]] = field(default_factory=list)
+    gateway: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -91,6 +99,7 @@ class ETLOrchestrator:
         self.balancer = ResourceLoadBalancer()
         self.schema_evolution = SchemaEvolutionEngine()
         self.alert = AlertMatcher()
+        self.ledger: QualityGateLedger = quality_ledger
 
         # 注册默认资源池
         self.balancer.register_pool(ResourcePool(
@@ -200,24 +209,78 @@ class ETLOrchestrator:
         pipeline_id: str,
         rules: list[QualityRule],
         sample_data: list[dict[str, Any]],
+        *,
+        batch_id: str | None = None,
+        target_table: str | None = None,
+        partition: str = "",
     ) -> QualityGateResponse:
-        """执行管线质量门禁。"""
+        """执行管线质量门禁，并落地阻断回执 + 登记告警。
+
+        告警依据只取**每条规则自己的**坏行率，不使用跨规则汇总的
+        ``overall_failed_ratio``；后者会把地区规则的合格行混进订单键，
+        稀释坏行率，导致阻断成立却没有告警。
+        """
         result = self.validation.run_pipeline_quality(rules, sample_data, pipeline_id)
+        validation_results = result["validation_results"]
         overall_pass = result["overall_pass"]
         failed_ratio = result["overall_failed_ratio"]
 
-        # 触发告警
-        alert_rules = [
-            AlertRule(
+        # 每条规则独立评估：指标是规则自身的坏行率，阈值也是规则自身的阈值。
+        alert_rules: list[AlertRule] = []
+        metrics_by_alert_rule: dict[str, dict[str, Any]] = {}
+        rule_by_alert_id: dict[str, QualityRule] = {}
+        for r in rules:
+            alert_rule = AlertRule(
                 rule_id=f"qalert_{r.rule_id}",
                 rule_name=f"质量检查:{r.rule_name}",
                 monitor_target=pipeline_id,
                 condition=f"failed_ratio > {r.threshold}",
                 level=AlertLevel.WARN if r.level == CheckLevel.WARN else AlertLevel.CRITICAL,
             )
-            for r in rules
-        ]
-        alerts = self.alert.match_batch(alert_rules, {"failed_ratio": failed_ratio})
+            alert_rules.append(alert_rule)
+            rule_by_alert_id[alert_rule.rule_id] = r
+
+        results_by_rule = {r.rule_id: r for r in validation_results}
+        for alert_rule in alert_rules:
+            quality_rule = rule_by_alert_id[alert_rule.rule_id]
+            rule_result = results_by_rule.get(quality_rule.rule_id)
+            metrics_by_alert_rule[alert_rule.rule_id] = {
+                "failed_ratio": float(rule_result.failed_ratio) if rule_result else 1.0,
+                # 便于排查：同时暴露规则自己的阈值、样本数和坏行数。
+                "threshold": quality_rule.threshold,
+                "sample_size": int(rule_result.sample_size) if rule_result else 0,
+                "bad_rows": int(rule_result.failed_rows) if rule_result else 0,
+                "rule_version": quality_rule.rule_version,
+            }
+
+        alerts: list[AlertResult] = []
+        for alert_rule in alert_rules:
+            metrics = metrics_by_alert_rule[alert_rule.rule_id]
+            alerts.append(self.alert.match(alert_rule, metrics))
+
+        # 落地回执：同一批次重放返回同一份回执（结论已确认）。
+        effective_batch_id = batch_id or pipeline_id
+        effective_table = target_table or next(
+            (r.target_table for r in rules if r.target_table), ""
+        )
+        fingerprint = self.ledger.batch_fingerprint(
+            pipeline_id=pipeline_id,
+            target_table=effective_table,
+            partition=partition,
+            rules=[self._rule_signature(r) for r in rules],
+            sample_data=sample_data,
+        )
+        receipt, is_replay = self.ledger.record_receipt(
+            pipeline_id=pipeline_id,
+            target_table=effective_table,
+            partition=partition,
+            batch_id=effective_batch_id,
+            fingerprint=fingerprint,
+            validation_results=validation_results,
+        )
+        # 告警只从回执里的越线规则登记；并发重放只保留一个告警身份。
+        alert_events = self.ledger.register_alerts_for_receipt(receipt)
+        receipt_view = self.ledger.receipt_view(receipt)
 
         return QualityGateResponse(
             pipeline_id=pipeline_id,
@@ -226,7 +289,30 @@ class ETLOrchestrator:
             failed_ratio=failed_ratio,
             results=result["rule_results"],
             triggered_alerts=alerts,
+            receipt_id=receipt.receipt_id,
+            batch_id=receipt.batch_id,
+            receipt=receipt_view,
+            alert_events=[e.as_dict() for e in alert_events],
+            gateway={
+                "receipt_replay": is_replay,
+                "alert_source": "receipt.alerting_rules",
+                "alert_state": receipt_view["alert_state"],
+                "receiver_connected": receipt_view["receiver_connected"],
+                "next_action": receipt_view["next_action"],
+                "batch_disposition": receipt_view["batch_disposition"],
+            },
         )
+
+    @staticmethod
+    def _rule_signature(rule: QualityRule) -> dict[str, Any]:
+        return {
+            "rule_id": rule.rule_id,
+            "rule_version": rule.rule_version,
+            "check_field": rule.check_field,
+            "check_type": rule.check_type.value,
+            "threshold": rule.threshold,
+            "level": rule.level.value,
+        }
 
     # ---- 水位与回刷 ----
 

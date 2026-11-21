@@ -54,18 +54,20 @@ class AlertPolicyService(BaseModuleService):
         triggered = False
         threshold = 0.0
         try:
-            if ">" in condition:
-                threshold_str = condition.split(">")[1].strip()
-                threshold = float(threshold_str.replace("%", ""))
-                triggered = metric_value > threshold
-            elif "<" in condition:
-                threshold_str = condition.split("<")[1].strip()
-                threshold = float(threshold_str.replace("%", ""))
-                triggered = metric_value < threshold
-            elif ">=" in condition:
-                threshold_str = condition.split(">=")[1].strip()
-                threshold = float(threshold_str.replace("%", ""))
-                triggered = metric_value >= threshold
+            # 先匹配双字符操作符，避免 ">=" 被 ">" 抢先切成 "= 0.01"。
+            for op in (">=", "<=", "==", "!=", ">", "<"):
+                if op in condition:
+                    threshold_str = condition.split(op, 1)[1].strip()
+                    threshold = float(threshold_str.replace("%", ""))
+                    triggered = {
+                        ">": metric_value > threshold,
+                        ">=": metric_value >= threshold,
+                        "<": metric_value < threshold,
+                        "<=": metric_value <= threshold,
+                        "==": abs(metric_value - threshold) < 1e-9,
+                        "!=": abs(metric_value - threshold) >= 1e-9,
+                    }[op]
+                    break
         except (ValueError, IndexError):
             pass
 
@@ -158,3 +160,62 @@ class AlertPolicyService(BaseModuleService):
         if entry:
             entry["last_operated_at"] = datetime.now().isoformat()
         return entry, msg
+
+    # ---- 质量批次回执 → 告警面板 ----
+
+    def evaluate_receipt_alerts(self, receipt_id: str) -> dict[str, Any]:
+        """按质量批次阻断回执的越线规则评估告警。
+
+        告警依据必须来自回执里每条规则自己的阈值、样本数和坏行数，
+        不能用批次汇总坏行率——那会把合格行的规则混进来稀释坏行率。
+        """
+        from app.engine.quality_receipt import quality_ledger
+
+        receipt = quality_ledger.get_receipt(receipt_id)
+        if receipt is None:
+            return {"error": f"回执 {receipt_id} 不存在"}
+
+        evaluations: list[dict[str, Any]] = []
+        for decision in receipt.rule_decisions:
+            evaluations.append({
+                "rule_id": decision.rule_id,
+                "rule_name": decision.rule_name,
+                "rule_version": decision.rule_version,
+                "threshold": decision.threshold,
+                "sample_size": decision.sample_size,
+                "bad_rows": decision.failed_rows,
+                "bad_ratio": round(decision.failed_ratio, 6),
+                "threshold_exceeded": decision.threshold_exceeded,
+                "blocked": decision.blocked,
+                "decision": decision.decision,
+                "triggered": decision.threshold_exceeded,
+                "judgement": decision.threshold_judgement,
+            })
+
+        return {
+            "receipt_id": receipt.receipt_id,
+            "batch_id": receipt.batch_id,
+            "pipeline_id": receipt.pipeline_id,
+            "decision": receipt.decision,
+            "triggered_rules": [e for e in evaluations if e["triggered"]],
+            "all_rules": evaluations,
+            "alert_events": [
+                e.as_dict() for e in quality_ledger.list_alerts(receipt_id=receipt_id)
+            ],
+            "alert_state": quality_ledger.receipt_view(receipt)["alert_state"],
+            "evaluated_at": datetime.now().isoformat(),
+        }
+
+    def active_quality_alerts(self) -> dict[str, Any]:
+        """告警面板：质量批次阻断回执登记给值班组的告警事件。"""
+        from app.engine.quality_receipt import quality_ledger
+
+        events = quality_ledger.list_alerts()
+        return {
+            "total": len(events),
+            "receiver_connected": quality_ledger.receiver_connected,
+            "pending": sum(1 for e in events if e.status == "PENDING"),
+            "delivered": sum(1 for e in events if e.status == "DELIVERED"),
+            "items": [e.as_dict() for e in events],
+            "snapshot_at": datetime.now().isoformat(),
+        }
